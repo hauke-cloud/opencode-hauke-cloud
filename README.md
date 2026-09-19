@@ -10,6 +10,26 @@ Zitadel, ...): it opens a browser to your identity provider, runs the PKCE excha
 a fresh `Authorization: Bearer <token>` on every request opencode makes to that provider,
 refreshing it in the background before it expires.
 
+## Installation
+
+opencode resolves plugins named in the `plugin` array of `opencode.json` by fetching them
+from the public npm registry itself (via Bun, at startup, cached under
+`~/.cache/opencode/node_modules/`) — there's no `npm install` step for the end user, and no
+support for git URLs or local paths in that config array.
+
+That means this package has to be published to npm before the config below will resolve:
+
+```sh
+npm install
+npm run build
+npm publish --access public
+```
+
+Once `opencode-oidc-plugin` exists on the registry, using it is just the `opencode.json`
+below — no separate install command. Bump `version` in `package.json` and re-run
+`npm publish` for updates; pin a version in the config (`"opencode-oidc-plugin@0.2.0"`)
+if you don't want opencode picking up a new release automatically.
+
 ## How it fits together
 
 - opencode calls this plugin once per `[name, options]` entry in your `opencode.json` `plugin` array.
@@ -35,7 +55,7 @@ Register a client on your OIDC issuer with:
     ["opencode-oidc-plugin", {
       "provider": "llama-swap",
       "issuer": "https://id.hauke.cloud/realms/cloud",
-      "clientId": "llama-swap-opencode"
+      "clientId": "prod-llama-swap-opencode"
     }]
   ],
   "provider": {
