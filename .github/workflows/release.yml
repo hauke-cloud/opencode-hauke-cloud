@@ -1,0 +1,85 @@
+name: release
+
+# Every push to main is a release candidate. svu reads the conventional commits
+# since the last v* tag and decides the next version -- "fix:" bumps the patch,
+# "feat:" the minor, "feat!:"/"BREAKING CHANGE:" the major. Commits that don't
+# warrant a release (docs:, chore:, ...) leave the version alone and nothing is
+# published. The tag is pushed from this same run because tags pushed with the
+# workflow's GITHUB_TOKEN don't trigger other workflows.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push the tag, create the GitHub release
+  id-token: write # npm trusted publishing + provenance
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # svu needs the full history and every tag to find the last release.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      - name: github-action-svu
+        uses: charlesthomas/github-action-svu@v1.1.3+3.2.3
+        id: version
+        with:
+          pushTag: true
+          verbose: true
+          cmd: next
+
+      - name: Decide whether to release
+        id: release
+        env:
+          CURRENT: ${{ steps.version.outputs.current }}
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          if [ -n "${NEXT}" ] && [ "${NEXT}" != "${CURRENT}" ]; then
+            echo "tag=${NEXT}" >> "$GITHUB_OUTPUT"
+            echo "version=${NEXT#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "No release-worthy commits since ${CURRENT}; nothing to publish."
+          fi
+
+      # package.json's version is a placeholder; the tag svu just pushed is the
+      # source of truth, so stamp it in for the published tarball only.
+      - name: Set package version
+        if: steps.release.outputs.version
+        run: npm version "${{ steps.release.outputs.version }}" --no-git-tag-version --allow-same-version
+
+      # Trusted publishing needs npm >= 11.5.1, newer than some Node LTS bundles.
+      - if: steps.release.outputs.version
+        run: npm install -g npm@latest
+
+      # Authenticates through the trusted publisher configured on npmjs.com for
+      # this repo and workflow -- no NPM_TOKEN secret.
+      - name: Publish to npm
+        if: steps.release.outputs.version
+        run: npm publish --access public --provenance
+
+      - name: Create GitHub release
+        if: steps.release.outputs.version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ steps.release.outputs.tag }}" --generate-notes --verify-tag

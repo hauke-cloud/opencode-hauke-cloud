@@ -1,10 +1,12 @@
-import type { Plugin } from "@opencode-ai/plugin"
+import type { Credential, Plugin } from "@opencode/plugin"
 import { startCallbackServer } from "./callback-server.js"
 import { discoverIssuer } from "./discovery.js"
+import { decodeJwtClaims } from "./jwt.js"
+import { fetchModels, toModelInfo, type RemoteModel } from "./models.js"
 import { generatePkce, generateState } from "./pkce.js"
 import { exchangeCode, refreshAccessToken, resolveExpiryMs } from "./token.js"
 
-export interface OidcPluginOptions {
+export interface OidcProviderOptions {
   /** Provider id in opencode.json this plugin authenticates. Must match exactly. */
   provider: string
   /** OIDC issuer, e.g. "https://id.hauke.cloud/realms/cloud". Discovery is read from "<issuer>/.well-known/openid-configuration". */
@@ -17,16 +19,30 @@ export interface OidcPluginOptions {
   callbackPort?: number
   /** Loopback path for the redirect_uri. */
   callbackPath?: string
-  /** Seconds of safety margin before expiry at which loader() proactively refreshes. */
-  refreshSkewSeconds?: number
   /** Seconds to wait for the browser login to complete before giving up. */
   loginTimeoutSeconds?: number
+  /**
+   * After sign-in, list the provider's models from "<baseURL>/models" with the
+   * signed-in account's token and add any the config doesn't already define.
+   */
+  discoverModels?: boolean
 }
+
+/**
+ * Either a single provider's options, or several under "providers". opencode v2
+ * refuses to load two plugins with the same id, so this package can only be
+ * listed once -- authenticating more than one provider goes through the array.
+ */
+export type OidcPluginOptions = OidcProviderOptions | { providers: OidcProviderOptions[] }
+
+export const PLUGIN_ID = "opencode-oidc-plugin"
+// Branded in opencode's schema; the brand is compile-time only, so a cast keeps
+// this package free of a runtime dependency on @opencode/plugin.
+export const METHOD_ID = "oidc" as Credential.OAuth["methodID"]
 
 const DEFAULT_SCOPE = "openid profile email offline_access"
 const DEFAULT_CALLBACK_PORT = 51121
 const DEFAULT_CALLBACK_PATH = "/callback"
-const DEFAULT_REFRESH_SKEW_SECONDS = 30
 const DEFAULT_LOGIN_TIMEOUT_SECONDS = 300
 
 interface ResolvedOptions {
@@ -36,180 +52,273 @@ interface ResolvedOptions {
   scope: string
   callbackPort: number
   callbackPath: string
-  refreshSkewMs: number
   loginTimeoutMs: number
+  discoverModels: boolean
 }
 
-function resolveOptions(options: unknown): ResolvedOptions {
-  const o = (options ?? {}) as Partial<OidcPluginOptions>
-  const missing = (["provider", "issuer", "clientId"] as const).filter((key) => !o[key])
-  if (missing.length > 0) {
-    throw new Error(
-      `opencode-oidc-plugin: missing required option(s) ${missing.join(", ")}. ` +
-        `Configure this plugin with a [name, options] tuple in opencode.json's "plugin" array, ` +
-        `e.g. ["opencode-oidc-plugin", { "provider": "my-provider", "issuer": "https://id.example.com/realms/cloud", "clientId": "my-client" }].`,
-    )
+export function resolveOptions(options: unknown): ResolvedOptions[] {
+  const o = (options ?? {}) as Partial<OidcProviderOptions> & { providers?: unknown }
+  const entries = (Array.isArray(o.providers) ? o.providers : [o]) as Partial<OidcProviderOptions>[]
+  if (entries.length === 0) {
+    throw new Error(`${PLUGIN_ID}: "providers" is empty -- list at least one provider to authenticate.`)
   }
-  return {
-    provider: o.provider!,
-    issuer: o.issuer!,
-    clientId: o.clientId!,
-    scope: o.scope ?? DEFAULT_SCOPE,
-    callbackPort: o.callbackPort ?? DEFAULT_CALLBACK_PORT,
-    callbackPath: o.callbackPath ?? DEFAULT_CALLBACK_PATH,
-    refreshSkewMs: (o.refreshSkewSeconds ?? DEFAULT_REFRESH_SKEW_SECONDS) * 1000,
-    loginTimeoutMs: (o.loginTimeoutSeconds ?? DEFAULT_LOGIN_TIMEOUT_SECONDS) * 1000,
+
+  const resolved = entries.map((entry, index) => {
+    const missing = (["provider", "issuer", "clientId"] as const).filter((key) => !entry?.[key])
+    if (missing.length > 0) {
+      const where = Array.isArray(o.providers) ? ` in providers[${index}]` : ""
+      throw new Error(
+        `${PLUGIN_ID}: missing required option(s) ${missing.join(", ")}${where}. ` +
+          `Configure this plugin in opencode.json's "plugin" array with options, ` +
+          `e.g. ["${PLUGIN_ID}", { "provider": "my-provider", "issuer": "https://id.example.com/realms/cloud", "clientId": "my-client" }].`,
+      )
+    }
+    return {
+      provider: entry.provider!,
+      issuer: entry.issuer!,
+      clientId: entry.clientId!,
+      scope: entry.scope ?? DEFAULT_SCOPE,
+      callbackPort: entry.callbackPort ?? DEFAULT_CALLBACK_PORT,
+      callbackPath: entry.callbackPath ?? DEFAULT_CALLBACK_PATH,
+      loginTimeoutMs: (entry.loginTimeoutSeconds ?? DEFAULT_LOGIN_TIMEOUT_SECONDS) * 1000,
+      discoverModels: entry.discoverModels ?? false,
+    }
+  })
+
+  const seen = new Set<string>()
+  for (const { provider } of resolved) {
+    if (seen.has(provider)) throw new Error(`${PLUGIN_ID}: provider "${provider}" is configured more than once.`)
+    seen.add(provider)
   }
+  return resolved
 }
 
-interface OAuthSession {
-  access: string
-  refresh: string
-  expires: number
-}
-
-// opencode calls this once per [name, options] entry in the "plugin" config
-// array, so `options` is fixed for the lifetime of the returned Hooks object
-// -- each entry gets its own closures, its own callback-server port, its own
-// in-flight refresh below, etc.
-export const createOidcAuthPlugin: Plugin = async (input, options) => {
-  const opts = resolveOptions(options)
-
-  // Two requests racing in with an expired access token must not each fire
+// The pieces of an OAuth integration method for one provider. opencode owns
+// everything around them: it persists the credential, calls refresh() when the
+// stored access token is within a few minutes of expiry, and hands the fresh
+// access token to the provider's SDK as its apiKey -- which @ai-sdk/openai-compatible
+// sends as "Authorization: Bearer <token>".
+export function createOidcMethod(opts: ResolvedOptions) {
+  // Two model resolutions racing in with an expiring token must not each fire
   // their own refresh_token grant: Keycloak (like most IdPs) rotates the
   // refresh token on use, so the loser's grant would be replayed against an
   // already-consumed token and the whole session would die instead of just
-  // refreshing. Funnelling concurrent refreshes through one in-flight
-  // promise means only the first caller talks to the token endpoint; the
-  // rest await its result.
-  let refreshInFlight: Promise<OAuthSession> | null = null
+  // refreshing. Remembering which refresh token the last grant consumed means
+  // every caller holding that token -- whether it arrives while the grant is
+  // in flight or read the credential just before opencode stored the rotated
+  // one -- shares that grant's result instead of replaying it.
+  let lastRefresh: { from: string; result: Promise<Credential.OAuth> } | null = null
 
-  async function refreshSession(current: OAuthSession): Promise<OAuthSession> {
-    if (!refreshInFlight) {
-      refreshInFlight = (async () => {
-        try {
-          const discovery = await discoverIssuer(opts.issuer)
-          const refreshed = await refreshAccessToken(discovery.token_endpoint, {
-            clientId: opts.clientId,
-            refreshToken: current.refresh,
-          })
-          const next: OAuthSession = {
-            access: refreshed.access_token,
-            refresh: refreshed.refresh_token ?? current.refresh,
-            expires: resolveExpiryMs(refreshed),
-          }
-          await input.client.auth.set({
-            path: { id: opts.provider },
-            body: { type: "oauth", ...next },
-          })
-          return next
-        } finally {
-          refreshInFlight = null
-        }
-      })()
+  async function refreshCredential(current: Credential.OAuth): Promise<Credential.OAuth> {
+    const discovery = await discoverIssuer(opts.issuer)
+    const refreshed = await refreshAccessToken(discovery.token_endpoint, {
+      clientId: opts.clientId,
+      refreshToken: current.refresh,
+    })
+    return {
+      type: "oauth",
+      methodID: current.methodID,
+      access: refreshed.access_token,
+      refresh: refreshed.refresh_token ?? current.refresh,
+      expires: resolveExpiryMs(refreshed),
     }
-    return refreshInFlight
   }
 
   return {
-    auth: {
-      provider: opts.provider,
-      methods: [
-        {
-          type: "oauth",
-          label: `Sign in with ${safeHost(opts.issuer)}`,
-          async authorize() {
-            const discovery = await discoverIssuer(opts.issuer)
-            const pkce = generatePkce()
-            const state = generateState()
-            const redirectUri = `http://127.0.0.1:${opts.callbackPort}${opts.callbackPath}`
+    integrationID: opts.provider,
+    method: {
+      id: METHOD_ID,
+      type: "oauth" as const,
+      label: `Sign in with ${safeHost(opts.issuer)}`,
+    },
 
-            const listener = await startCallbackServer({
-              port: opts.callbackPort,
-              path: opts.callbackPath,
-              state,
-              timeoutMs: opts.loginTimeoutMs,
-            })
+    async authorize() {
+      const discovery = await discoverIssuer(opts.issuer)
+      const pkce = generatePkce()
+      const state = generateState()
+      const redirectUri = `http://127.0.0.1:${opts.callbackPort}${opts.callbackPath}`
 
-            const authorizeUrl = new URL(discovery.authorization_endpoint)
-            authorizeUrl.searchParams.set("client_id", opts.clientId)
-            authorizeUrl.searchParams.set("response_type", "code")
-            authorizeUrl.searchParams.set("redirect_uri", redirectUri)
-            authorizeUrl.searchParams.set("scope", opts.scope)
-            authorizeUrl.searchParams.set("state", state)
-            authorizeUrl.searchParams.set("code_challenge", pkce.challenge)
-            authorizeUrl.searchParams.set("code_challenge_method", "S256")
+      const listener = await startCallbackServer({
+        port: opts.callbackPort,
+        path: opts.callbackPath,
+        state,
+        timeoutMs: opts.loginTimeoutMs,
+      })
 
-            return {
-              url: authorizeUrl.toString(),
-              instructions: `Sign in with your ${safeHost(opts.issuer)} account. If your browser didn't open, visit the URL above.`,
-              method: "auto",
-              async callback() {
-                try {
-                  const received = await listener.result
-                  if (received.error || !received.code) {
-                    const reason = received.errorDescription ?? received.error ?? "no code received"
-                    throw new Error(`opencode-oidc-plugin: login did not complete (${reason}).`)
-                  }
+      const authorizeUrl = new URL(discovery.authorization_endpoint)
+      authorizeUrl.searchParams.set("client_id", opts.clientId)
+      authorizeUrl.searchParams.set("response_type", "code")
+      authorizeUrl.searchParams.set("redirect_uri", redirectUri)
+      authorizeUrl.searchParams.set("scope", opts.scope)
+      authorizeUrl.searchParams.set("state", state)
+      authorizeUrl.searchParams.set("code_challenge", pkce.challenge)
+      authorizeUrl.searchParams.set("code_challenge_method", "S256")
 
-                  const tokens = await exchangeCode(discovery.token_endpoint, {
-                    clientId: opts.clientId,
-                    code: received.code,
-                    redirectUri,
-                    codeVerifier: pkce.verifier,
-                  })
+      const callback = (async (): Promise<Credential.OAuth> => {
+        try {
+          const received = await listener.result
+          if (received.error || !received.code) {
+            const reason = received.errorDescription ?? received.error ?? "no code received"
+            throw new Error(`${PLUGIN_ID}: login did not complete (${reason}).`)
+          }
 
-                  if (!tokens.refresh_token) {
-                    // Without a refresh token the session dies the moment the
-                    // short-lived access token expires, which for a CLI tool
-                    // that's used sporadically is every session. Fail loudly
-                    // here rather than leave the user to discover it as a
-                    // silent 401 five minutes into their next opencode run.
-                    throw new Error(
-                      `opencode-oidc-plugin: token response for client "${opts.clientId}" had no refresh_token. ` +
-                        `Enable the "offline_access" scope on this client (and include it in the plugin's "scope" option, the default already does).`,
-                    )
-                  }
+          const tokens = await exchangeCode(discovery.token_endpoint, {
+            clientId: opts.clientId,
+            code: received.code,
+            redirectUri,
+            codeVerifier: pkce.verifier,
+          })
 
-                  return {
-                    type: "success",
-                    refresh: tokens.refresh_token,
-                    access: tokens.access_token,
-                    expires: resolveExpiryMs(tokens),
-                  }
-                } finally {
-                  listener.close()
-                }
-              },
-            }
-          },
-        },
-      ],
-      async loader(getAuth) {
-        return {
-          apiKey: "oidc-managed",
-          async fetch(url: string | URL | Request, init?: RequestInit) {
-            const auth = await getAuth()
-            if (auth.type !== "oauth") {
-              throw new Error(
-                `opencode-oidc-plugin: provider "${opts.provider}" has no OIDC session yet -- run "opencode auth login" and pick it.`,
-              )
-            }
+          if (!tokens.refresh_token) {
+            // Without a refresh token the session dies the moment the
+            // short-lived access token expires, which for a CLI tool
+            // that's used sporadically is every session. Fail loudly
+            // here rather than leave the user to discover it as a
+            // silent 401 five minutes into their next opencode run.
+            throw new Error(
+              `${PLUGIN_ID}: token response for client "${opts.clientId}" had no refresh_token. ` +
+                `Enable the "offline_access" scope on this client (and include it in the plugin's "scope" option, the default already does).`,
+            )
+          }
 
-            let session: OAuthSession = auth
-            if (session.expires - opts.refreshSkewMs < Date.now()) {
-              session = await refreshSession(session)
-            }
-
-            const headers = new Headers(init?.headers)
-            headers.delete("authorization")
-            headers.set("authorization", `Bearer ${session.access}`)
-            return fetch(url, { ...init, headers })
-          },
+          return {
+            type: "oauth",
+            methodID: METHOD_ID,
+            refresh: tokens.refresh_token,
+            access: tokens.access_token,
+            expires: resolveExpiryMs(tokens),
+          }
+        } finally {
+          listener.close()
         }
-      },
+      })()
+      // opencode awaits this as soon as authorize() returns; the extra handler
+      // only keeps a login that's abandoned before then from surfacing as an
+      // unhandled rejection when the listener times out.
+      callback.catch(() => {})
+
+      return {
+        url: authorizeUrl.toString(),
+        instructions: `Sign in with your ${safeHost(opts.issuer)} account. If your browser didn't open, visit the URL above.`,
+        // Expire opencode's pending attempt together with our loopback listener.
+        expiresAt: Date.now() + opts.loginTimeoutMs,
+        mode: "auto" as const,
+        callback,
+      }
+    },
+
+    refresh(current: Credential.OAuth): Promise<Credential.OAuth> {
+      if (lastRefresh?.from !== current.refresh) {
+        const entry = { from: current.refresh, result: refreshCredential(current) }
+        // A failed grant didn't consume anything worth sharing -- let the next caller retry.
+        entry.result.catch(() => {
+          if (lastRefresh === entry) lastRefresh = null
+        })
+        lastRefresh = entry
+      }
+      return lastRefresh.result
+    },
+
+    // Shown next to the saved connection in `opencode auth list`.
+    label(credential: Credential.OAuth): string | undefined {
+      const claims = decodeJwtClaims(credential.access)
+      const name = claims?.preferred_username ?? claims?.email
+      return typeof name === "string" ? `${name} @ ${safeHost(opts.issuer)}` : undefined
     },
   }
+}
+
+type Context = Parameters<Plugin.Plugin["setup"]>[0]
+type Connection = NonNullable<Awaited<ReturnType<Context["integration"]["connection"]["active"]>>>
+
+// Keeps a provider's model list in step with what the signed-in account can
+// see. Discovery runs at startup and whenever the provider's active account
+// changes (sign-in, sign-out, switching accounts) -- not on token refreshes,
+// which don't change who's asking.
+export async function discoverProviderModels(ctx: Context, providerID: string, signal: AbortSignal) {
+  let loaded: { models: RemoteModel[]; connection: Connection } | undefined
+
+  // Discovered models are bound to the connection that listed them, so opencode
+  // never shows one account's models while another is signed in. Models the
+  // config already defines keep their definitions; opencode re-applies config
+  // overrides on top of discovered ones afterwards either way.
+  await ctx.provider.transform((editor) => {
+    const record = editor.get(providerID)
+    if (!record || !loaded) return
+    const models = new Map(record.models)
+    for (const remote of loaded.models) {
+      const existing = models.get(remote.id)
+      if (!existing) models.set(remote.id, toModelInfo(providerID, remote))
+      // A config entry that only adjusts, say, limits still gets the listed display name.
+      else if (remote.name && existing.name === existing.id) models.set(remote.id, { ...existing, name: remote.name })
+    }
+    editor.add({ info: record.provider, models: [...models.values()], sourceConnection: loaded.connection })
+  })
+
+  async function load() {
+    const connection = await ctx.integration.connection.active(providerID)
+    if (!connection) {
+      loaded = undefined
+      return
+    }
+    const credential = await ctx.integration.connection.resolve(connection)
+    if (credential?.type !== "oauth") {
+      loaded = undefined
+      return
+    }
+    const provider = await ctx.provider.get({ providerID })
+    const baseURL = provider.data.settings?.baseURL
+    if (typeof baseURL !== "string") {
+      throw new Error(`${PLUGIN_ID}: provider "${providerID}" has no baseURL to discover models from.`)
+    }
+    loaded = { models: await fetchModels(baseURL, credential.access), connection }
+  }
+
+  // Refreshes run one at a time so a slow listing can't land after a newer one.
+  let queue = Promise.resolve()
+  const refresh = () => {
+    queue = queue.then(async () => {
+      const before = loaded
+      try {
+        await load()
+      } catch (error) {
+        // Keep the last good list through a transient outage rather than
+        // making the provider's models flicker away.
+        console.warn(`${PLUGIN_ID}: model discovery for "${providerID}" failed:`, error)
+        return
+      }
+      if (loaded !== before && !signal.aborted) await ctx.provider.reload()
+    })
+    return queue
+  }
+
+  void refresh()
+  void (async () => {
+    try {
+      for await (const event of ctx.event.subscribe({ signal })) {
+        if (event.type === "credential.switched" && event.data.integrationID === providerID) void refresh()
+      }
+    } catch (error) {
+      if (!signal.aborted) console.warn(`${PLUGIN_ID}: lost the event stream for "${providerID}":`, error)
+    }
+  })()
+}
+
+const plugin: Plugin.Plugin = {
+  id: PLUGIN_ID,
+  async setup(ctx) {
+    const providers = resolveOptions(ctx.options)
+    const methods = providers.map(createOidcMethod)
+    await ctx.integration.transform((editor) => {
+      for (const method of methods) editor.method.update(method)
+    })
+
+    const controller = new AbortController()
+    for (const opts of providers) {
+      if (opts.discoverModels) await discoverProviderModels(ctx, opts.provider, controller.signal)
+    }
+    return () => controller.abort()
+  },
 }
 
 function safeHost(issuer: string): string {
@@ -220,4 +329,4 @@ function safeHost(issuer: string): string {
   }
 }
 
-export default createOidcAuthPlugin
+export default plugin

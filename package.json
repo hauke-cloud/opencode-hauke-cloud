@@ -1,7 +1,7 @@
 {
   "name": "opencode-oidc-plugin",
-  "version": "0.1.0",
-  "description": "Generic OIDC/PKCE browser-login auth plugin for opencode custom model providers",
+  "version": "0.0.0-development",
+  "description": "Generic OIDC/PKCE browser-login auth plugin for opencode v2 custom model providers",
   "type": "module",
   "license": "MIT",
   "author": "Hauke Mettendorf",
@@ -26,6 +26,7 @@
   "types": "dist/index.d.ts",
   "files": [
     "dist",
+    "!dist/__tests__",
     "README.md"
   ],
   "engines": {
@@ -36,10 +37,10 @@
     "dev": "tsc -p tsconfig.json --watch",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pretest": "npm run build",
-    "test": "node --test dist"
+    "test": "node --test \"dist/**/*.test.js\""
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.18.31",
+    "@opencode/plugin": "^2.0.11",
     "@types/node": "^26.6.1",
     "typescript": "7.0.2"
   }

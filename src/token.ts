@@ -13,14 +13,14 @@ export interface TokenResponse {
 // expires_in in ways that drift from it. If the access token isn't a JWT
 // (opaque tokens are legal OIDC), or a response has neither a decodable exp
 // claim nor a sane expires_in, fail loudly -- silently computing a NaN or
-// negative expiry means loader() would either never refresh or refresh on
-// every single request.
+// negative expiry means opencode would either never refresh or refresh on
+// every single request. opencode stores expiry as an integer, hence the floor.
 export function resolveExpiryMs(tokens: TokenResponse): number {
   const fromJwt = decodeJwtExpiryMs(tokens.access_token)
-  if (fromJwt !== null) return fromJwt
+  if (fromJwt !== null) return Math.floor(fromJwt)
 
   if (typeof tokens.expires_in === "number" && Number.isFinite(tokens.expires_in) && tokens.expires_in > 0) {
-    return Date.now() + tokens.expires_in * 1000
+    return Math.floor(Date.now() + tokens.expires_in * 1000)
   }
 
   throw new Error(

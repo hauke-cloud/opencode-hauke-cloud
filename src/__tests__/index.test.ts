@@ -1,6 +1,12 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { createOidcAuthPlugin } from "../index.js"
+import plugin, { METHOD_ID, PLUGIN_ID, createOidcMethod, resolveOptions } from "../index.js"
+
+function fakeJwt(payload: Record<string, unknown>): string {
+  const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url")
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url")
+  return `${header}.${body}.signature`
+}
 
 function withMockFetch<T>(impl: typeof fetch, run: () => Promise<T>): Promise<T> {
   const original = globalThis.fetch
@@ -10,110 +16,125 @@ function withMockFetch<T>(impl: typeof fetch, run: () => Promise<T>): Promise<T>
   })
 }
 
-test("loader dedupes concurrent refreshes instead of racing on a rotating refresh token", async () => {
-  let refreshCalls = 0
-  let authSet: { path: { id: string }; body: { type: string; access: string; refresh: string; expires: number } } | null = null
+const baseOptions = {
+  provider: "llama-swap",
+  issuer: "https://id.example.com/realms/cloud",
+  clientId: "opencode",
+}
 
-  const fakeInput = {
-    client: {
-      auth: {
-        set: async (args: typeof authSet) => {
-          authSet = args
-        },
+const discoveryResponse = () =>
+  new Response(
+    JSON.stringify({
+      issuer: "https://id.example.com/realms/cloud",
+      authorization_endpoint: "https://id.example.com/realms/cloud/protocol/openid-connect/auth",
+      token_endpoint: "https://id.example.com/realms/cloud/protocol/openid-connect/token",
+    }),
+    { status: 200 },
+  )
+
+function stale(refresh: string) {
+  return { type: "oauth" as const, methodID: METHOD_ID, access: "stale-access", refresh, expires: Date.now() - 1000 }
+}
+
+test("setup registers one OAuth method per configured provider", async () => {
+  const registered: { integrationID: string; method: { id: string; type: string } }[] = []
+  await plugin.setup({
+    options: {
+      providers: [baseOptions, { ...baseOptions, provider: "other", clientId: "other-client" }],
+    },
+    integration: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({ method: { update: (input: (typeof registered)[number]) => registered.push(input) } })
+        return { dispose: async () => {} }
       },
     },
-  }
+  } as never)
 
-  await withMockFetch(
-    (async (input: string | URL | Request) => {
-      const url = String(input)
-      if (url.endsWith("/.well-known/openid-configuration")) {
-        return new Response(
-          JSON.stringify({
-            issuer: "https://id.example.com/realms/cloud",
-            authorization_endpoint: "https://id.example.com/realms/cloud/protocol/openid-connect/auth",
-            token_endpoint: "https://id.example.com/realms/cloud/protocol/openid-connect/token",
-          }),
-          { status: 200 },
-        )
-      }
-      if (url === "https://id.example.com/realms/cloud/protocol/openid-connect/token") {
-        refreshCalls++
-        return new Response(
-          JSON.stringify({ access_token: "fresh-access", refresh_token: "fresh-refresh", expires_in: 300, token_type: "Bearer" }),
-          { status: 200 },
-        )
-      }
-      if (url === "https://backend.example.com/v1/models") {
-        return new Response("ok", { status: 200 })
-      }
-      throw new Error(`unexpected fetch to ${url}`)
-    }) as typeof fetch,
-    async () => {
-      const hooks = await createOidcAuthPlugin(fakeInput as never, {
-        provider: "llama-swap",
-        issuer: "https://id.example.com/realms/cloud",
-        clientId: "opencode",
-      })
-
-      const expiredAuth = {
-        type: "oauth" as const,
-        access: "stale-access",
-        refresh: "stale-refresh",
-        expires: Date.now() - 1000,
-      }
-      const wired = await hooks.auth!.loader!(async () => expiredAuth as never, {} as never)
-
-      const [a, b] = await Promise.all([
-        wired.fetch("https://backend.example.com/v1/models"),
-        wired.fetch("https://backend.example.com/v1/models"),
-      ])
-
-      assert.equal(a.status, 200)
-      assert.equal(b.status, 200)
-      assert.equal(refreshCalls, 1, "both concurrent requests should share a single refresh call")
-      assert.equal(authSet?.path.id, "llama-swap")
-      assert.equal(authSet?.body.access, "fresh-access")
-      assert.equal(authSet?.body.refresh, "fresh-refresh")
-      assert.ok(authSet && authSet.body.expires > Date.now())
-    },
+  assert.equal(plugin.id, PLUGIN_ID)
+  assert.deepEqual(
+    registered.map((r) => [r.integrationID, r.method.id, r.method.type]),
+    [
+      ["llama-swap", METHOD_ID, "oauth"],
+      ["other", METHOD_ID, "oauth"],
+    ],
   )
 })
 
-test("loader sends the fresh access token as a Bearer header, stripping any pre-existing Authorization", async () => {
-  let seenAuthHeader: string | null = null
+test("resolveOptions accepts a flat options object and rejects missing or duplicate providers", () => {
+  assert.equal(resolveOptions(baseOptions)[0].scope, "openid profile email offline_access")
+  assert.throws(() => resolveOptions({ issuer: "x" }), /missing required option\(s\) provider, clientId/)
+  assert.throws(() => resolveOptions({ providers: [baseOptions, { issuer: "x" }] }), /in providers\[1\]/)
+  assert.throws(() => resolveOptions({ providers: [baseOptions, baseOptions] }), /configured more than once/)
+  assert.throws(() => resolveOptions({ providers: [] }), /"providers" is empty/)
+})
+
+test("refresh dedupes concurrent and replayed grants for the same rotating refresh token", async () => {
+  let refreshCalls = 0
 
   await withMockFetch(
     (async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input)
-      if (url === "https://backend.example.com/v1/models") {
-        seenAuthHeader = new Headers(init?.headers).get("authorization")
-        return new Response("ok", { status: 200 })
+      if (url.endsWith("/.well-known/openid-configuration")) return discoveryResponse()
+      if (url === "https://id.example.com/realms/cloud/protocol/openid-connect/token") {
+        refreshCalls++
+        const sent = new URLSearchParams(String(init?.body)).get("refresh_token")
+        return new Response(
+          JSON.stringify({ access_token: `access-for-${sent}`, refresh_token: `after-${sent}`, expires_in: 300, token_type: "Bearer" }),
+          { status: 200 },
+        )
       }
       throw new Error(`unexpected fetch to ${url}`)
     }) as typeof fetch,
     async () => {
-      const hooks = await createOidcAuthPlugin({} as never, {
-        provider: "llama-swap",
-        issuer: "https://id.example.com/realms/cloud",
-        clientId: "opencode",
-      })
+      const method = createOidcMethod(resolveOptions(baseOptions)[0])
 
-      const validAuth = { type: "oauth" as const, access: "still-valid", refresh: "r", expires: Date.now() + 60_000 }
-      const wired = await hooks.auth!.loader!(async () => validAuth as never, {} as never)
+      const [a, b] = await Promise.all([method.refresh(stale("r1")), method.refresh(stale("r1"))])
+      assert.equal(refreshCalls, 1, "both concurrent callers should share a single refresh call")
+      assert.deepEqual(a, b)
+      assert.equal(a.type, "oauth")
+      assert.equal(a.methodID, METHOD_ID)
+      assert.equal(a.access, "access-for-r1")
+      assert.equal(a.refresh, "after-r1")
+      assert.ok(Number.isInteger(a.expires) && a.expires > Date.now())
 
-      await wired.fetch("https://backend.example.com/v1/models", { headers: { authorization: "Bearer forged" } })
-      assert.equal(seenAuthHeader, "Bearer still-valid")
+      // A caller that read the credential before opencode stored the rotated
+      // token must not replay the consumed one.
+      const late = await method.refresh(stale("r1"))
+      assert.equal(refreshCalls, 1)
+      assert.equal(late.refresh, "after-r1")
+
+      const next = await method.refresh(stale("after-r1"))
+      assert.equal(refreshCalls, 2)
+      assert.equal(next.refresh, "after-after-r1")
     },
   )
 })
 
-test("loader throws a clear error when the provider has no OIDC session", async () => {
-  const hooks = await createOidcAuthPlugin({} as never, {
-    provider: "llama-swap",
-    issuer: "https://id.example.com/realms/cloud",
-    clientId: "opencode",
-  })
-  const wired = await hooks.auth!.loader!(async () => ({ type: "api", key: "irrelevant" }) as never, {} as never)
-  await assert.rejects(() => wired.fetch("https://backend.example.com/v1/models"), /has no OIDC session yet/)
+test("refresh keeps the old refresh token when the IdP doesn't rotate it, and retries after a failure", async () => {
+  let fail = true
+
+  await withMockFetch(
+    (async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.endsWith("/.well-known/openid-configuration")) return discoveryResponse()
+      if (fail) return new Response("invalid_grant", { status: 400, statusText: "Bad Request" })
+      return new Response(JSON.stringify({ access_token: "fresh", expires_in: 300, token_type: "Bearer" }), { status: 200 })
+    }) as typeof fetch,
+    async () => {
+      const method = createOidcMethod(resolveOptions(baseOptions)[0])
+      await assert.rejects(() => method.refresh(stale("r1")), /400 Bad Request/)
+
+      fail = false
+      const refreshed = await method.refresh(stale("r1"))
+      assert.equal(refreshed.access, "fresh")
+      assert.equal(refreshed.refresh, "r1")
+    },
+  )
+})
+
+test("label names the signed-in account from the access token's claims", () => {
+  const method = createOidcMethod(resolveOptions(baseOptions)[0])
+  const credential = { ...stale("r"), access: fakeJwt({ preferred_username: "hauke", exp: 1 }) }
+  assert.equal(method.label(credential), "hauke @ id.example.com")
+  assert.equal(method.label({ ...credential, access: "opaque" }), undefined)
 })
