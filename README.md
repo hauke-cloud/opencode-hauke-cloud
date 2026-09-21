@@ -23,12 +23,22 @@ Releases are cut by `.github/workflows/release.yml` on every push to `main`, ver
 since the last `v*` tag: `fix:` bumps the patch, `feat:` the minor, `feat!:` or a
 `BREAKING CHANGE:` footer the major. When a bump is due, the workflow pushes the tag, stamps
 the version into `package.json` for the tarball (the committed version is a placeholder),
-publishes to npm and creates a GitHub release. Pushes with only `docs:`, `chore:`, etc.
+stages it on npm and creates a GitHub release. Pushes with only `docs:`, `chore:`, etc.
 publish nothing.
 
-The workflow publishes with npm trusted publishing, so no token is stored in the repo. Set it
-up once on npmjs.com under the package's *Settings → Trusted publishing*: GitHub Actions,
-repository `hauke-cloud/opencode-oidc-plugin`, workflow `release.yml`.
+The workflow authenticates with npm trusted publishing, so no token is stored in the repo,
+and it only ever runs `npm stage publish`: a release sits on the registry unpublished until
+a maintainer approves it with 2FA. The run's summary shows the commands:
+
+```sh
+npm stage list opencode-oidc-plugin
+npm stage approve <stage-id>
+```
+
+The trusted publisher is set up on npmjs.com under the package's *Settings → Trusted
+publishing* (GitHub Actions, repository `hauke-cloud/opencode-oidc-plugin`, workflow
+`release.yml`) with only stage publishing allowed — equivalently
+`npm trust github opencode-oidc-plugin --repo hauke-cloud/opencode-oidc-plugin --file release.yml --allow-stage-publish`.
 
 Once `opencode-oidc-plugin` exists on the registry, using it is just the `opencode.json`
 below — no separate install command. Pin a version in the config (`"opencode-oidc-plugin@1.0.0"`)

@@ -17,7 +17,7 @@ concurrency:
 
 permissions:
   contents: write # push the tag, create the GitHub release
-  id-token: write # npm trusted publishing + provenance
+  id-token: write # npm trusted (staged) publishing + provenance
 
 jobs:
   release:
@@ -68,15 +68,28 @@ jobs:
         if: steps.release.outputs.version
         run: npm version "${{ steps.release.outputs.version }}" --no-git-tag-version --allow-same-version
 
-      # Trusted publishing needs npm >= 11.5.1, newer than some Node LTS bundles.
+      # Staged publishing needs a newer npm than some Node LTS releases bundle.
       - if: steps.release.outputs.version
         run: npm install -g npm@latest
 
       # Authenticates through the trusted publisher configured on npmjs.com for
-      # this repo and workflow -- no NPM_TOKEN secret.
-      - name: Publish to npm
+      # this repo and workflow -- no NPM_TOKEN secret. The trust relationship only
+      # allows staged publishing: the version lands on the registry unpublished
+      # until a maintainer approves it with 2FA.
+      - name: Stage on npm
         if: steps.release.outputs.version
-        run: npm publish --access public --provenance
+        run: |
+          npm stage publish --access public --provenance
+          {
+            echo "### opencode-oidc-plugin ${{ steps.release.outputs.version }} is staged on npm"
+            echo
+            echo "Approve it (prompts for 2FA) to make it installable:"
+            echo
+            echo '```sh'
+            echo "npm stage list opencode-oidc-plugin"
+            echo "npm stage approve <stage-id>"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create GitHub release
         if: steps.release.outputs.version
