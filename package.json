@@ -1,7 +1,7 @@
 {
-  "name": "opencode-oidc-plugin",
+  "name": "opencode-hauke-cloud",
   "version": "0.0.0-development",
-  "description": "Generic OIDC/PKCE browser-login auth plugin for opencode v2 custom model providers",
+  "description": "hauke.cloud for opencode: OIDC sign-in, model discovery and mem0 long-term memory",
   "type": "module",
   "license": "MIT",
   "author": "Hauke Mettendorf",
@@ -14,7 +14,8 @@
     "opencode-plugin",
     "oauth2",
     "oidc",
-    "pkce"
+    "pkce",
+    "mem0"
   ],
   "exports": {
     ".": {

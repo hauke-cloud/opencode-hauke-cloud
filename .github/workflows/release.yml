@@ -81,12 +81,12 @@ jobs:
         run: |
           npm stage publish --access public --provenance
           {
-            echo "### opencode-oidc-plugin ${{ steps.release.outputs.version }} is staged on npm"
+            echo "### opencode-hauke-cloud ${{ steps.release.outputs.version }} is staged on npm"
             echo
             echo "Approve it (prompts for 2FA) to make it installable:"
             echo
             echo '```sh'
-            echo "npm stage list opencode-oidc-plugin"
+            echo "npm stage list opencode-hauke-cloud"
             echo "npm stage approve <stage-id>"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

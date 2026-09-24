@@ -16,12 +16,12 @@ export async function fetchModels(baseURL: string, accessToken: string): Promise
   })
   if (!res.ok) {
     const detail = await res.text().catch(() => "")
-    throw new Error(`opencode-oidc-plugin: model listing ${endpoint} failed (${res.status} ${res.statusText}): ${detail}`)
+    throw new Error(`opencode-hauke-cloud: model listing ${endpoint} failed (${res.status} ${res.statusText}): ${detail}`)
   }
 
   const body = (await res.json()) as { data?: unknown }
   if (!Array.isArray(body?.data)) {
-    throw new Error(`opencode-oidc-plugin: model listing ${endpoint} returned no "data" array.`)
+    throw new Error(`opencode-hauke-cloud: model listing ${endpoint} returned no "data" array.`)
   }
 
   const models = new Map<string, RemoteModel>()

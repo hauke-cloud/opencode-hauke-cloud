@@ -2,17 +2,22 @@ import type { Credential, Plugin } from "@opencode/plugin"
 import { startCallbackServer } from "./callback-server.js"
 import { discoverIssuer } from "./discovery.js"
 import { decodeJwtClaims } from "./jwt.js"
+import { MEMORY_DEFAULTS, setupMemory, type MemoryOptions } from "./memory.js"
 import { fetchModels, toModelInfo, type RemoteModel } from "./models.js"
 import { generatePkce, generateState } from "./pkce.js"
 import { exchangeCode, refreshAccessToken, resolveExpiryMs } from "./token.js"
 
-export interface OidcProviderOptions {
-  /** Provider id in opencode.json this plugin authenticates. Must match exactly. */
-  provider: string
-  /** OIDC issuer, e.g. "https://id.hauke.cloud/realms/cloud". Discovery is read from "<issuer>/.well-known/openid-configuration". */
-  issuer: string
+export interface HaukeCloudOptions {
+  /** Provider (and integration) id the plugin defines and authenticates. */
+  provider?: string
+  /** Display name of the provider. */
+  name?: string
+  /** OpenAI-compatible endpoint the provider's models are served from. */
+  baseURL?: string
+  /** OIDC issuer. Discovery is read from "<issuer>/.well-known/openid-configuration". */
+  issuer?: string
   /** Public client id, registered for PKCE with no client secret. */
-  clientId: string
+  clientId?: string
   /** Space-separated scopes. Include "offline_access" to avoid re-login every time the access token expires. */
   scope?: string
   /** Loopback port for the redirect_uri. Must be registered verbatim as a valid redirect URI on the client. */
@@ -26,27 +31,38 @@ export interface OidcProviderOptions {
    * signed-in account's token and add any the config doesn't already define.
    */
   discoverModels?: boolean
+  /** Long-term memory through mem0, authenticated with the same login. false turns it off. */
+  memory?: false | Partial<MemoryOptions>
 }
 
-/**
- * Either a single provider's options, or several under "providers". opencode v2
- * refuses to load two plugins with the same id, so this package can only be
- * listed once -- authenticating more than one provider goes through the array.
- */
-export type OidcPluginOptions = OidcProviderOptions | { providers: OidcProviderOptions[] }
-
-export const PLUGIN_ID = "opencode-oidc-plugin"
+export const PLUGIN_ID = "opencode-hauke-cloud"
 // Branded in opencode's schema; the brand is compile-time only, so a cast keeps
 // this package free of a runtime dependency on @opencode/plugin.
 export const METHOD_ID = "oidc" as Credential.OAuth["methodID"]
 
-const DEFAULT_SCOPE = "openid profile email offline_access"
-const DEFAULT_CALLBACK_PORT = 51121
-const DEFAULT_CALLBACK_PATH = "/callback"
-const DEFAULT_LOGIN_TIMEOUT_SECONDS = 300
+// Everything defaults to hauke.cloud, so the plugin line alone is a working
+// setup. Each value can still be overridden in the plugin's options.
+export const DEFAULTS = {
+  provider: "hauke-cloud",
+  name: "hauke.cloud",
+  baseURL: "https://llama.llm.hauke.cloud/v1",
+  issuer: "https://id.hauke.cloud/realms/cloud",
+  clientId: "prod-llama-swap-opencode",
+  scope: "openid profile email offline_access",
+  callbackPort: 51121,
+  callbackPath: "/callback",
+  loginTimeoutSeconds: 300,
+  discoverModels: true,
+} as const
 
-interface ResolvedOptions {
+// The SDK package opencode loads for the provider; it sends the access token as
+// "Authorization: Bearer <token>".
+const PROVIDER_PACKAGE = "@ai-sdk/openai-compatible"
+
+export interface ResolvedOptions {
   provider: string
+  name: string
+  baseURL: string
   issuer: string
   clientId: string
   scope: string
@@ -54,43 +70,34 @@ interface ResolvedOptions {
   callbackPath: string
   loginTimeoutMs: number
   discoverModels: boolean
+  memory: MemoryOptions | false
 }
 
-export function resolveOptions(options: unknown): ResolvedOptions[] {
-  const o = (options ?? {}) as Partial<OidcProviderOptions> & { providers?: unknown }
-  const entries = (Array.isArray(o.providers) ? o.providers : [o]) as Partial<OidcProviderOptions>[]
-  if (entries.length === 0) {
-    throw new Error(`${PLUGIN_ID}: "providers" is empty -- list at least one provider to authenticate.`)
+export function resolveOptions(options: unknown): ResolvedOptions {
+  const o = (options ?? {}) as HaukeCloudOptions & { providers?: unknown }
+  if (o.providers !== undefined) {
+    throw new Error(
+      `${PLUGIN_ID}: "providers" is not supported -- this plugin sets up a single provider; ` +
+        `put its options directly in the plugin's options.`,
+    )
   }
-
-  const resolved = entries.map((entry, index) => {
-    const missing = (["provider", "issuer", "clientId"] as const).filter((key) => !entry?.[key])
-    if (missing.length > 0) {
-      const where = Array.isArray(o.providers) ? ` in providers[${index}]` : ""
-      throw new Error(
-        `${PLUGIN_ID}: missing required option(s) ${missing.join(", ")}${where}. ` +
-          `Configure this plugin in opencode.json's "plugin" array with options, ` +
-          `e.g. ["${PLUGIN_ID}", { "provider": "my-provider", "issuer": "https://id.example.com/realms/cloud", "clientId": "my-client" }].`,
-      )
-    }
-    return {
-      provider: entry.provider!,
-      issuer: entry.issuer!,
-      clientId: entry.clientId!,
-      scope: entry.scope ?? DEFAULT_SCOPE,
-      callbackPort: entry.callbackPort ?? DEFAULT_CALLBACK_PORT,
-      callbackPath: entry.callbackPath ?? DEFAULT_CALLBACK_PATH,
-      loginTimeoutMs: (entry.loginTimeoutSeconds ?? DEFAULT_LOGIN_TIMEOUT_SECONDS) * 1000,
-      discoverModels: entry.discoverModels ?? false,
-    }
-  })
-
-  const seen = new Set<string>()
-  for (const { provider } of resolved) {
-    if (seen.has(provider)) throw new Error(`${PLUGIN_ID}: provider "${provider}" is configured more than once.`)
-    seen.add(provider)
+  const provider = o.provider ?? DEFAULTS.provider
+  return {
+    provider,
+    name: o.name ?? DEFAULTS.name,
+    baseURL: o.baseURL ?? DEFAULTS.baseURL,
+    issuer: o.issuer ?? DEFAULTS.issuer,
+    clientId: o.clientId ?? DEFAULTS.clientId,
+    scope: o.scope ?? DEFAULTS.scope,
+    callbackPort: o.callbackPort ?? DEFAULTS.callbackPort,
+    callbackPath: o.callbackPath ?? DEFAULTS.callbackPath,
+    loginTimeoutMs: (o.loginTimeoutSeconds ?? DEFAULTS.loginTimeoutSeconds) * 1000,
+    discoverModels: o.discoverModels ?? DEFAULTS.discoverModels,
+    memory:
+      o.memory === false
+        ? false
+        : { ...MEMORY_DEFAULTS, localProviders: ["ollama", provider], ...(o.memory ?? {}) },
   }
-  return resolved
 }
 
 // The pieces of an OAuth integration method for one provider. opencode owns
@@ -313,17 +320,34 @@ export async function discoverProviderModels(ctx: Context, providerID: string, s
 const plugin: Plugin.Plugin = {
   id: PLUGIN_ID,
   async setup(ctx) {
-    const providers = resolveOptions(ctx.options)
-    const methods = providers.map(createOidcMethod)
+    const opts = resolveOptions(ctx.options)
+    const method = createOidcMethod(opts)
     await ctx.integration.transform((editor) => {
-      for (const method of methods) editor.method.update(method)
+      editor.update(opts.provider, (integration) => {
+        integration.name = opts.name
+      })
+      editor.method.update(method)
+    })
+
+    // Defines the provider so opencode.json needs no "provider" block. Plugin
+    // transforms run before opencode's config transform, so a "provider" entry
+    // with the same id still applies on top of this. Activation stays "auto":
+    // the provider shows up once its integration has a signed-in connection.
+    await ctx.provider.transform((editor) => {
+      editor.update(opts.provider, (provider) => {
+        provider.name = opts.name
+        provider.package = PROVIDER_PACKAGE
+        provider.settings = { ...provider.settings, baseURL: opts.baseURL }
+      })
     })
 
     const controller = new AbortController()
-    for (const opts of providers) {
-      if (opts.discoverModels) await discoverProviderModels(ctx, opts.provider, controller.signal)
+    if (opts.discoverModels) await discoverProviderModels(ctx, opts.provider, controller.signal)
+    const disposeMemory = opts.memory ? await setupMemory(ctx, opts.provider, opts.memory, PLUGIN_ID) : undefined
+    return async () => {
+      controller.abort()
+      await disposeMemory?.()
     }
-    return () => controller.abort()
   },
 }
 

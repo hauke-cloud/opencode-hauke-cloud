@@ -25,7 +25,7 @@ async function fetchDiscovery(issuer: string): Promise<OidcDiscovery> {
   const url = `${normalizedIssuer}/.well-known/openid-configuration`
   const res = await fetch(url)
   if (!res.ok) {
-    throw new Error(`opencode-oidc-plugin: discovery request to ${url} failed (${res.status} ${res.statusText})`)
+    throw new Error(`opencode-hauke-cloud: discovery request to ${url} failed (${res.status} ${res.statusText})`)
   }
   const doc = (await res.json()) as OidcDiscovery
 
@@ -39,7 +39,7 @@ async function fetchDiscovery(issuer: string): Promise<OidcDiscovery> {
   // nothing and catches exactly that.
   if (doc.issuer !== normalizedIssuer) {
     throw new Error(
-      `opencode-oidc-plugin: discovery document from ${url} claims issuer "${doc.issuer}", expected "${normalizedIssuer}" -- refusing to trust it.`,
+      `opencode-hauke-cloud: discovery document from ${url} claims issuer "${doc.issuer}", expected "${normalizedIssuer}" -- refusing to trust it.`,
     )
   }
 
@@ -55,7 +55,7 @@ async function fetchDiscovery(issuer: string): Promise<OidcDiscovery> {
 function assertHttps(value: string | undefined, field: string, discoveryUrl: string): asserts value is string {
   if (!value || !value.startsWith("https://")) {
     throw new Error(
-      `opencode-oidc-plugin: discovery document from ${discoveryUrl} has a non-https ${field} ("${value}") -- refusing to use it.`,
+      `opencode-hauke-cloud: discovery document from ${discoveryUrl} has a non-https ${field} ("${value}") -- refusing to use it.`,
     )
   }
 }

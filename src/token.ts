@@ -24,7 +24,7 @@ export function resolveExpiryMs(tokens: TokenResponse): number {
   }
 
   throw new Error(
-    'opencode-oidc-plugin: token response had no decodable JWT "exp" claim and no usable expires_in -- refusing to guess an expiry.',
+    'opencode-hauke-cloud: token response had no decodable JWT "exp" claim and no usable expires_in -- refusing to guess an expiry.',
   )
 }
 
@@ -36,7 +36,7 @@ async function postForm(endpoint: string, body: Record<string, string>): Promise
   })
   if (!res.ok) {
     const detail = await res.text().catch(() => "")
-    throw new Error(`opencode-oidc-plugin: token request to ${endpoint} failed (${res.status} ${res.statusText}): ${detail}`)
+    throw new Error(`opencode-hauke-cloud: token request to ${endpoint} failed (${res.status} ${res.statusText}): ${detail}`)
   }
   return (await res.json()) as TokenResponse
 }
