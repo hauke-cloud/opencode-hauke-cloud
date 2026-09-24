@@ -3,7 +3,7 @@ import { startCallbackServer } from "./callback-server.js"
 import { discoverIssuer } from "./discovery.js"
 import { decodeJwtClaims } from "./jwt.js"
 import { MEMORY_DEFAULTS, setupMemory, type MemoryOptions } from "./memory.js"
-import { fetchModels, toModelInfo, type RemoteModel } from "./models.js"
+import { fetchModels, matchOverrides, toModelInfo, type ModelOverride, type RemoteModel } from "./models.js"
 import { generatePkce, generateState } from "./pkce.js"
 import { exchangeCode, refreshAccessToken, resolveExpiryMs } from "./token.js"
 
@@ -31,6 +31,12 @@ export interface HaukeCloudOptions {
    * signed-in account's token and add any the config doesn't already define.
    */
   discoverModels?: boolean
+  /**
+   * Capabilities and limits of discovered models, which the listing doesn't
+   * report, keyed by model id or a pattern with "*" wildcards, e.g.
+   * { "*-vl-*": { capabilities: { input: ["text", "image"] } } }.
+   */
+  models?: Record<string, ModelOverride>
   /** Long-term memory through mem0, authenticated with the same login. false turns it off. */
   memory?: false | Partial<MemoryOptions>
 }
@@ -70,6 +76,7 @@ export interface ResolvedOptions {
   callbackPath: string
   loginTimeoutMs: number
   discoverModels: boolean
+  models: Record<string, ModelOverride>
   memory: MemoryOptions | false
 }
 
@@ -93,6 +100,7 @@ export function resolveOptions(options: unknown): ResolvedOptions {
     callbackPath: o.callbackPath ?? DEFAULTS.callbackPath,
     loginTimeoutMs: (o.loginTimeoutSeconds ?? DEFAULTS.loginTimeoutSeconds) * 1000,
     discoverModels: o.discoverModels ?? DEFAULTS.discoverModels,
+    models: o.models ?? {},
     memory:
       o.memory === false
         ? false
@@ -242,7 +250,12 @@ type Connection = NonNullable<Awaited<ReturnType<Context["integration"]["connect
 // see. Discovery runs at startup and whenever the provider's active account
 // changes (sign-in, sign-out, switching accounts) -- not on token refreshes,
 // which don't change who's asking.
-export async function discoverProviderModels(ctx: Context, providerID: string, signal: AbortSignal) {
+export async function discoverProviderModels(
+  ctx: Context,
+  providerID: string,
+  signal: AbortSignal,
+  overrides: Record<string, ModelOverride> = {},
+) {
   let loaded: { models: RemoteModel[]; connection: Connection } | undefined
 
   // Discovered models are bound to the connection that listed them, so opencode
@@ -261,7 +274,7 @@ export async function discoverProviderModels(ctx: Context, providerID: string, s
     const models = new Map(record.models)
     for (const remote of loaded.models) {
       const existing = models.get(remote.id)
-      if (!existing) models.set(remote.id, toModelInfo(providerID, remote))
+      if (!existing) models.set(remote.id, toModelInfo(providerID, remote, matchOverrides(overrides, remote.id)))
       // A config entry that only adjusts, say, limits still gets the listed display name.
       else if (remote.name && existing.name === existing.id) models.set(remote.id, { ...existing, name: remote.name })
     }
@@ -342,7 +355,7 @@ const plugin: Plugin.Plugin = {
     })
 
     const controller = new AbortController()
-    if (opts.discoverModels) await discoverProviderModels(ctx, opts.provider, controller.signal)
+    if (opts.discoverModels) await discoverProviderModels(ctx, opts.provider, controller.signal, opts.models)
     const disposeMemory = opts.memory ? await setupMemory(ctx, opts.provider, opts.memory, PLUGIN_ID) : undefined
     return async () => {
       controller.abort()

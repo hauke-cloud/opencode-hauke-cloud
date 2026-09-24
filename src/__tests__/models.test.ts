@@ -1,7 +1,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { discoverProviderModels } from "../index.js"
-import { fetchModels, toModelInfo } from "../models.js"
+import { fetchModels, matchOverrides, toModelInfo } from "../models.js"
 
 function withMockFetch<T>(impl: typeof fetch, run: () => Promise<T>): Promise<T> {
   const original = globalThis.fetch
@@ -54,6 +54,24 @@ test("toModelInfo falls back to the id for the name", () => {
   assert.equal(info.name, "gpt-oss")
   assert.equal(info.providerID, "llama-swap")
   assert.deepEqual(info.capabilities.input, ["text"])
+})
+
+test("matchOverrides applies wildcard patterns in order, then the exact entry", () => {
+  const overrides = {
+    "qwen*": { limit: { context: 131_072 } },
+    "*-vl-*": { capabilities: { input: ["text", "image"] }, limit: { context: 65_536 } },
+    "qwen3-vl-8b": { name: "Qwen3 VL", limit: { output: 8_192 } },
+    "qwen3-vl": { name: "not a pattern, not this id" },
+  }
+  const matched = matchOverrides(overrides, "qwen3-vl-8b")
+  assert.deepEqual(matched, [overrides["qwen*"], overrides["*-vl-*"], overrides["qwen3-vl-8b"]])
+  assert.deepEqual(matchOverrides(overrides, "gpt-oss"), [])
+  assert.deepEqual(matchOverrides({ "a.b*": {} }, "axb-1"), [], "regex characters in a pattern match literally")
+
+  const info = toModelInfo("llama-swap", { id: "qwen3-vl-8b", name: "Listed" }, matched)
+  assert.equal(info.name, "Qwen3 VL")
+  assert.deepEqual(info.capabilities, { tools: true, input: ["text", "image"], output: ["text"] })
+  assert.deepEqual(info.limit, { context: 65_536, output: 8_192 })
 })
 
 // A stand-in for the slice of opencode's plugin context discovery uses: one
@@ -187,11 +205,18 @@ test("discovery creates the provider record when the config transform hasn't run
   await withMockFetch(
     (async () => new Response(JSON.stringify({ data: [{ id: "tiny", name: "Tiny" }] }), { status: 200 })) as typeof fetch,
     async () => {
-      await discoverProviderModels(ctx as never, "llama-swap", controller.signal)
+      await discoverProviderModels(ctx as never, "llama-swap", controller.signal, {
+        "ti*": { capabilities: { input: ["text", "image"] } },
+      })
       assert.equal(fold({ recordExists: false }), null, "no record is created before the first listing arrives")
       await settle()
       const added = fold({ recordExists: false })!
       assert.deepEqual(added.models.map((m) => [m.id, m.name]), [["tiny", "Tiny"]])
+      assert.deepEqual((added.models[0] as { capabilities?: unknown }).capabilities, {
+        tools: true,
+        input: ["text", "image"],
+        output: ["text"],
+      })
       assert.deepEqual(added.sourceConnection, { type: "credential", id: "cred_1", label: "a" })
     },
   )

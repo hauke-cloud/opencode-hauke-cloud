@@ -91,18 +91,23 @@ to only use models from the config.
 
 - Names come from the listing's `name` field (llama-swap sends one), falling back to the id.
 - The listing carries no limits or modalities, so discovered models get opencode's defaults
-  (200K context, 32K output, text in and out, tool calling on). A same-named entry under the
-  provider's `models` in `opencode.json` is applied on top, which is how to correct limits or
-  enable image input:
+  (200K context, 32K output, text in and out, tool calling on). The plugin's `models` option
+  corrects them, keyed by model id or by a pattern where `*` matches anything. Patterns apply
+  in the order they're written, then the exact id, so the most specific entry wins:
 
   ```jsonc
-  "provider": {
-    "hauke-cloud": {
-      "models": { "qwen3.8-27b-q4": { "limit": { "context": 196608, "output": 32768 } } }
+  ["opencode-hauke-cloud", {
+    "models": {
+      "*-vl-*": { "capabilities": { "input": ["text", "image"] } },
+      "qwen3.8-27b-q4": { "limit": { "context": 196608, "output": 32768 } }
     }
-  }
+  }]
   ```
 
+  Each entry can set `name`, `capabilities` (`tools`, `input`, `output`) and `limit`
+  (`context`, `output`); anything left out keeps its default.
+- A same-named entry under the provider's `models` in `opencode.json` is still applied on top
+  by opencode.
 - A config entry without a `name` (e.g. one that only sets `limit`) still gets the listed name.
 - Models the config defines stay listed even if the server doesn't report them.
 - Discovery runs at startup and when you sign in, sign out or switch accounts — not on token
@@ -167,6 +172,7 @@ All optional; the tuple form `["opencode-hauke-cloud", { ... }]` passes them.
 | `callbackPath` | `"/callback"` | Loopback path, same constraint. |
 | `loginTimeoutSeconds` | `300` | How long the browser login may take before the attempt is abandoned. |
 | `discoverModels` | `true` | List the models `<baseURL>/models` reports for the signed-in account. |
+| `models` | `{}` | Capabilities and limits of discovered models, by id or `*` pattern (see [Models](#models)). |
 | `memory` | `{}` | `false` turns memory off; otherwise the settings below. |
 
 `memory` settings:
