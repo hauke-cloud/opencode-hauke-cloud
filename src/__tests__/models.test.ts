@@ -100,12 +100,19 @@ function fakeContext() {
     },
   }
 
-  // Runs the registered transform against a provider record the config defined.
+  // Runs the registered transform against a provider record the config defined,
+  // or -- as opencode does for a provider only opencode.json defines, whose
+  // record the config transform creates after plugin transforms -- none at all.
   type Added = { models: { id: string; name: string }[]; sourceConnection: unknown }
-  function fold(): Added | null {
+  function fold({ recordExists = true } = {}): Added | null {
     const result: { added: Added | null } = { added: null }
+    let record = recordExists ? { provider: { id: "llama-swap" }, models: configured } : undefined
     state.transform!({
-      get: () => ({ provider: { id: "llama-swap" }, models: configured }),
+      get: () => record,
+      update: (id: string, edit: (info: { id: string }) => void) => {
+        record ??= { provider: { id }, models: new Map() }
+        edit(record.provider)
+      },
       add: (definition: Added) => {
         result.added = definition
       },
@@ -167,6 +174,25 @@ test("discovery adds listed models next to configured ones, bound to the listing
       await settle()
       assert.equal(state.reloads, 3)
       assert.equal(fold(), null, "signing out drops the discovered models")
+    },
+  )
+  controller.abort()
+  emit({ type: "shutdown" })
+})
+
+test("discovery creates the provider record when the config transform hasn't run yet", async () => {
+  const { ctx, fold, emit } = fakeContext()
+  const controller = new AbortController()
+
+  await withMockFetch(
+    (async () => new Response(JSON.stringify({ data: [{ id: "tiny", name: "Tiny" }] }), { status: 200 })) as typeof fetch,
+    async () => {
+      await discoverProviderModels(ctx as never, "llama-swap", controller.signal)
+      assert.equal(fold({ recordExists: false }), null, "no record is created before the first listing arrives")
+      await settle()
+      const added = fold({ recordExists: false })!
+      assert.deepEqual(added.models.map((m) => [m.id, m.name]), [["tiny", "Tiny"]])
+      assert.deepEqual(added.sourceConnection, { type: "credential", id: "cred_1", label: "a" })
     },
   )
   controller.abort()

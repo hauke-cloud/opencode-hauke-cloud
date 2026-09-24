@@ -243,8 +243,14 @@ export async function discoverProviderModels(ctx: Context, providerID: string, s
   // config already defines keep their definitions; opencode re-applies config
   // overrides on top of discovered ones afterwards either way.
   await ctx.provider.transform((editor) => {
+    if (!loaded) return
+    // opencode runs plugin transforms before its own config transform, so a
+    // provider that only opencode.json defines has no record yet at this point.
+    // update() creates it; the config transform fills in package and settings
+    // on top of it afterwards.
+    if (!editor.get(providerID)) editor.update(providerID, () => {})
     const record = editor.get(providerID)
-    if (!record || !loaded) return
+    if (!record) return
     const models = new Map(record.models)
     for (const remote of loaded.models) {
       const existing = models.get(remote.id)
